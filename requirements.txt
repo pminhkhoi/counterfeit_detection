@@ -1,0 +1,12 @@
+py_vncorenlp
+torch
+torchvision
+tqdm
+numpy
+pandas
+matplotlib
+transformers
+sentencepiece
+sacremoses
+imbalanced-learn
+protobuf
