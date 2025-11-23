@@ -5,7 +5,6 @@ import logging
 import random
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Union
-from collections import Counter
 
 import pandas as pd
 import numpy as np

@@ -1,6 +1,12 @@
-data/Kaggle/
-data/ViSpamV2/
+data/
 .vscode/
 .idea/
-archive.zip
-vispamdetectionv2.zip
+src/results/
+
+notebooks/
+src/dataset/data/
+src/dataset/__pycache__/
+src/preprocess/__pycache__/
+src/utils/__pycache__/
+src/models/__pycache__/
+src/utils/__pycache__/
