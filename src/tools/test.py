@@ -27,7 +27,7 @@ from utils.visualization import (
     plot_precision_recall_curve,
     plot_class_distribution
 )
-from preprocessing.preprocessing import preprocessing
+from preprocess.preprocessing import preprocessing
 
 
 def test_step(model, dataloader, device='cpu'):

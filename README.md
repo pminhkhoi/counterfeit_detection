@@ -85,14 +85,19 @@ pip install -r requirements.txt
 
 VnCoreNLP models are required for text segmentation. The models should be placed in `notebooks/vncorenlp/`.
 
-If models are not present, the preprocessing script will attempt to download them automatically. Alternatively, you can download manually:
+If models are not present, the preprocessing script will attempt to download them automatically.
 
 ```bash
 # The models will be auto-downloaded on first use, or you can:
 python -c "import py_vncorenlp; py_vncorenlp.download_model(save_dir='notebooks/vncorenlp')"
 ```
 
+Alternatively, you can download manually at https://github.com/vncorenlp/VnCoreNLP. Place `VnCoreNLP-1.2.jar` and folder `models` in the same directory, here in the code is `fake-review/data/`.
+
 ### 4. Prepare Data
+
+Install ViSpamDetection V2 dataset from https://github.com/sonlam1102/vispamdetection or https://www.kaggle.com/datasets/cinhvn/vispamdataset-v2.
+Extract the dataset at `fake-review/data/` or any directory (but will need to change path to the according directory).
 
 Your CSV files should contain at least:
 
@@ -102,9 +107,9 @@ Your CSV files should contain at least:
 Example CSV structure:
 
 ```csv
-comment,label
-"Đây là một sản phẩm tuyệt vời",0
-"Spam review fake",1
+comment, segmented_comment, label
+"Đây là một sản phẩm tuyệt vời", "Đây là một sản_phẩm tuyệt_vời", 0
+"Spam review fake", "Spam review fake", 1
 ```
 
 ## Data Preprocessing
@@ -112,20 +117,37 @@ comment,label
 The preprocessing pipeline includes:
 
 1. **Typo mapping**: Normalizes common typos and teen-code
+
+The mapping is stored in `src/mapping/json`. Manually add more mapping to further improve the performance of the model.
+
 2. **Word segmentation**: Uses VnCoreNLP to segment Vietnamese text
 
 ### Standalone Preprocessing
 
-You can preprocess data separately using:
+You can preprocess data separately (without imbalance addressing method) using:
 
 ```bash
-python src/preprocessing/preprocessing.py \
-    --csv data/train.csv \
+python -m src.preprocess.preprocessing \
+    --csv <Path_to_csv_data> \
     --mapping src/mapping.json \
     --vncorenlp_dir notebooks/vncorenlp \
     --out_dir src/dataset/data \
     --train_ratio 0.8 \
     --stratify_col label
+```
+
+You can apply back-translation to address imbalance dataset:
+
+```bash
+python -m src.preprocess.preprocessing \
+    --csv <Path_to_csv_data> \
+    --mapping src/mapping.json \
+    --vncorenlp_dir notebooks/vncorenlp \
+    --out_dir src/dataset/data \
+    --train_ratio 0.8 \
+    --stratify_col label \
+    --balance_method back_translation \
+    --augmentation_factor 2.0
 ```
 
 Options:
@@ -146,6 +168,7 @@ Options:
 If your data is already preprocessed:
 
 ```bash
+# Change `text_col` to your segmented review column
 python src/tools/train.py \
     --train_csv src/train.csv \
     --dev_csv src/dev.csv \
@@ -179,17 +202,6 @@ python src/tools/train.py \
     --preprocess \
     --augment back_translation \
     --augmentation_factor 2.0
-```
-
-**Random oversampling:**
-
-```bash
-python src/tools/train.py \
-    --train_csv data/train.csv \
-    --dev_csv data/dev.csv \
-    --preprocess \
-    --augment random \
-    --sampling_strategy auto
 ```
 
 ### Full Training Example with All Options
@@ -278,8 +290,11 @@ After training, the following files are saved in `{model_name}/` directory:
 Evaluate a trained model on test data:
 
 ```bash
+# Change the `text_col` to your segmented comment
 python src/tools/test.py \
     --test_csv data/test.csv \
+    --text_col segmented_comment \
+    --label_col label \
     --checkpoint src/results/checkpoints/2025-11-23_12-48-39/best_model_spam_classification.pth \
     --output_dir src/results/test_results
 ```

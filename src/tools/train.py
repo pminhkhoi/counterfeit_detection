@@ -26,8 +26,8 @@ from utils.visualization import save_training_history_plots
 from utils.early_stopping import EarlyStopping
 from dataset.dataset import CSVDataset
 from models.PhoBert import ViSpam_Classifier
-from preprocessing.preprocessing import preprocessing
-from preprocessing.imbalance_handler import apply_back_translation, apply_random_oversampling
+from preprocess.preprocessing import preprocessing
+from preprocess.imbalance_handler import apply_back_translation, apply_random_oversampling
 
 
 def train_step(model, criterion, optimizer, lr_scheduler, train_dataloader, device='cpu'):
