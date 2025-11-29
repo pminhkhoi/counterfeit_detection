@@ -134,7 +134,7 @@ class BackTranslator:
 
 def apply_back_translation(
         train_csv: Union[Path, pd.DataFrame],
-        text_col: str = "segmented_comment",
+        text_col: str = "preprocessed_review",
         label_col: str = "label",
         output_csv: Optional[Path] = None,
         minority_class: Optional[int] = None,

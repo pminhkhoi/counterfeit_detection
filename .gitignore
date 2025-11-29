@@ -2,6 +2,7 @@ data/
 .vscode/
 .idea/
 src/results/
+archive.zip
 
 notebooks/
 src/dataset/data/
@@ -9,4 +10,4 @@ src/dataset/__pycache__/
 src/preprocess/__pycache__/
 src/utils/__pycache__/
 src/models/__pycache__/
-src/utils/__pycache__/
+src/results

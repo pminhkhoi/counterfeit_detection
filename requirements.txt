@@ -10,3 +10,4 @@ sentencepiece
 sacremoses
 imbalanced-learn
 protobuf
+wordcloud

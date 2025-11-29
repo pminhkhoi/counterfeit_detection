@@ -3,391 +3,559 @@ import os
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Iterable
+from typing import Dict, Optional, Tuple, Iterable, List, Union, Any
 from sklearn.model_selection import train_test_split
-import logging
 import pandas as pd
 from tqdm import tqdm
 import py_vncorenlp
+from transformers import AutoTokenizer
+
 from .imbalance_handler import apply_back_translation, apply_random_oversampling
+from dataset.dataset import CSVDataset
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s - %(message)s")
 
-# Global segmenter instance to avoid JVM conflicts
-_SEGMENTER_INSTANCE = None
 
+class Preprocessor:
 
-def load_typo_mapper(mapper_path: Path) -> Dict[str, str]:
-    """Load JSON mapping file from disk."""
-    mapper_path = Path(mapper_path)
-    if not mapper_path.exists():
-        raise FileNotFoundError(f"Typo mapping file not found at: {mapper_path}")
-    with open(mapper_path, "r", encoding="utf-8") as fh:
-        mapper = json.load(fh)
-    if not isinstance(mapper, dict):
-        raise ValueError("Mapping JSON must be an object (dict).")
-    return mapper
+    def __init__(self, mapper_path: Optional[str] = None, vncorenlp_dir: Optional[str] = None) -> None:
+        """
+        Initialize Preprocessor.
 
+        Args:
+            train: Optional training CSVDataset
+            dev: Optional dev CSVDataset
+            test: Optional test CSVDataset
+            mapper_path: Path to typo mapping JSON file (required for preprocessing operations)
+        """
+        self.mapper: Optional[Dict[str, str]] = None
+        if mapper_path:
+            self.mapper = self.load_typo_mapper(mapper_path)
 
-def tokenize_words(review: str) -> list:
-    """Simple whitespace tokenizer (lowercases first)."""
-    if review is None:
-        return []
-    return str(review).lower().strip().split()
+        self.vncorenlp_dir: Optional[Path] = Path(vncorenlp_dir).resolve() if vncorenlp_dir else None
+        self.has_vncorenlp: bool = False
+        if self.vncorenlp_dir:
+            self.has_vncorenlp = self.ensure_vncorenlp_models(self.vncorenlp_dir)
 
+        self._SEGMENTER_INSTANCE = None
 
-def mapping_typo_token(token: str, mapper: Dict[str, str]) -> str:
-    """Map a single token using the mapper; return token if no mapping exists."""
-    return mapper.get(token, token)
+    @staticmethod
+    def split_train_test(
+        dataset: Union["CSVDataset", pd.DataFrame],
+        ratios: List[float],
+        stratify_col: Optional[str] = None,
+        random_state: int = 42
+    ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """
+        Split dataset into train/dev/test according to ratios (train, dev, test).
+        Always returns a 3-tuple (train_df, dev_df, test_df). If a split has ratio 0,
+        the corresponding tuple element is None.
 
+        Args:
+            dataset: CSVDataset or pandas DataFrame
+            ratios: list/tuple of three floats summing to 1.0 (train, dev, test)
+            stratify_col: optional column name used for stratified splitting
+            random_state: seed for reproducibility
 
-def segment_review(segmenter, review: str) -> str:
-    """Use VnCoreNLP segmenter to segment a single review."""
-    if review is None:
-        return ""
-    
-    review = str(review).strip()
-    if not review:
-        return ""
-    
-    review = review.lower()
-    try:
-        segmented = segmenter.word_segment(review)
-        if isinstance(segmented, list) and len(segmented) > 0:
-            first = segmented[0]
-            return " ".join(first) if isinstance(first, list) else first
-        return review
-    except Exception:
-        logger.exception("VnCoreNLP segmentation failed; returning original review.")
-        return review
+        Returns:
+            (train_df, dev_df, test_df) where elements may be None if their ratio is 0.
+        """
+        if len(ratios) != 3:
+            raise ValueError("Ratios must have length of 3 for train-dev-test.")
+        if any(r < 0 for r in ratios):
+            raise ValueError("Ratios must be non-negative.")
+        if abs(sum(ratios) - 1.0) > 1e-6:
+            raise ValueError("The total ratios of train-dev-test must sum to 1.")
 
+        train_ratio, dev_ratio, test_ratio = ratios
 
-def ensure_vncorenlp_models(vncorenlp_dir: Path, required_files: Optional[Iterable[str]] = None) -> bool:
-    """
-    Ensure the VnCoreNLP jar and model files exist in vncorenlp_dir.
-    If missing, attempt automatic download (py_vncorenlp.download_model) if available.
-    Returns True if models are present, False otherwise.
-    """
-    vncorenlp_dir = Path(vncorenlp_dir)
-    vncorenlp_dir.mkdir(parents=True, exist_ok=True)
-
-    if required_files is None:
-        required_files = [
-            "VnCoreNLP-1.2.jar",
-            "models/wordsegmenter/vi-vocab",
-            "models/wordsegmenter/wordsegmenter.rdr",
-        ]
-
-    missing = [f for f in required_files if not (vncorenlp_dir / f).exists()]
-
-    if not missing:
-        logger.info("VnCoreNLP models already present.")
-        return True
-
-    logger.info("VnCoreNLP models missing: %s", missing)
-    if py_vncorenlp is None:
-        logger.error("py_vncorenlp package is not installed.")
-        return False
-
-    try:
-        logger.info("Attempting automatic download of VnCoreNLP models to %s ...", vncorenlp_dir)
-        py_vncorenlp.download_model(save_dir=str(vncorenlp_dir))
-    except Exception:
-        logger.exception("Automatic download failed.")
-        return False
-
-    missing_after = [f for f in required_files if not (vncorenlp_dir / f).exists()]
-    if missing_after:
-        logger.error("Models still missing after download attempt: %s", missing_after)
-        return False
-
-    logger.info("VnCoreNLP download completed and models present.")
-    return True
-
-
-def build_segmenter(vncorenlp_dir: Path):
-    """
-    Instantiate the VnCoreNLP segmenter (singleton pattern).
-    Uses a global instance to avoid JVM conflicts.
-    """
-    global _SEGMENTER_INSTANCE
-    
-    if _SEGMENTER_INSTANCE is not None:
-        logger.info("Reusing existing VnCoreNLP segmenter instance.")
-        return _SEGMENTER_INSTANCE
-    
-    if py_vncorenlp is None:
-        raise ImportError("py_vncorenlp is required. Install with: pip install py_vncorenlp")
-    
-    # Convert to absolute path - THIS IS CRITICAL
-    vncorenlp_dir = Path(vncorenlp_dir).resolve()
-    
-    # Verify the JAR file exists
-    jar_path = vncorenlp_dir / "VnCoreNLP-1.2.jar"
-    if not jar_path.exists():
-        raise FileNotFoundError(
-            f"VnCoreNLP JAR not found at {jar_path}. "
-            f"Please ensure VnCoreNLP models are properly installed in {vncorenlp_dir}"
-        )
-    
-    logger.info(f"Creating new VnCoreNLP segmenter instance with directory: {vncorenlp_dir}")
-    
-    try:
-        _SEGMENTER_INSTANCE = py_vncorenlp.VnCoreNLP(
-            annotators=["wseg"], 
-            save_dir=str(vncorenlp_dir)
-        )
-        logger.info("VnCoreNLP segmenter created successfully.")
-    except Exception as e:
-        logger.error(f"Failed to create VnCoreNLP segmenter: {e}")
-        logger.error(f"VnCoreNLP directory: {vncorenlp_dir}")
-        logger.error(f"JAR exists: {jar_path.exists()}")
-        raise
-    
-    return _SEGMENTER_INSTANCE
-
-
-def segment_reviews(df: pd.DataFrame, vncorenlp_dir: Path, segmenter=None) -> pd.DataFrame:
-    """
-    Segment `preprocessed_review` column and store result in `segmented_comment`.
-    Expects df to already contain 'preprocessed_review' column.
-    
-    Args:
-        df: DataFrame with 'preprocessed_review' column
-        vncorenlp_dir: Path to VnCoreNLP models
-        segmenter: Optional existing segmenter instance (to avoid recreating)
-    """
-    if "preprocessed_review" not in df.columns:
-        raise ValueError("DataFrame must contain 'preprocessed_review' column before segmentation.")
-
-    vncorenlp_dir = Path(vncorenlp_dir)
-    ok = ensure_vncorenlp_models(vncorenlp_dir)
-    if not ok:
-        raise RuntimeError("VnCoreNLP models are not available. See logs for instructions.")
-
-    # Reuse existing segmenter or create new one
-    if segmenter is None:
-        segmenter = build_segmenter(vncorenlp_dir)
-
-    segmented_reviews = []
-    for review in tqdm(df["preprocessed_review"].tolist(), desc="Segmenting reviews"):
-        try:
-            seg = segment_review(segmenter, review)
-        except Exception:
-            logger.exception("Failed to segment a review; using original preprocessed text.")
-            seg = review or ""
-        segmented_reviews.append(seg)
-
-    df = df.copy()
-    df["segmented_comment"] = segmented_reviews
-    return df
-
-
-def preprocessing(df: pd.DataFrame,
-                  mapper_path: Path = Path("src/mapping.json"),
-                  vncorenlp_dir: Path = Path("notebooks/vncorenlp"),
-                  save_csv_path: Optional[Path] = None) -> pd.DataFrame:
-    """
-    Full preprocessing:
-      - load typo mapping
-      - fix token-level typos in `comment` -> new column `preprocessed_review`
-      - segment reviews using VnCoreNLP -> new column `segmented_comment`
-    Returns processed DataFrame.
-    """
-    df = df.copy()
-    mapper = load_typo_mapper(mapper_path)
-
-    # Build preprocessed_review by tokenizing and mapping typos
-    preprocessed_list = []
-    for comment in tqdm(df["comment"].tolist(), desc="Mapping typos"):
-        tokens = tokenize_words(comment)
-        mapped = [mapping_typo_token(t, mapper) for t in tokens]
-        preprocessed_list.append(" ".join(mapped))
-    df["preprocessed_review"] = preprocessed_list
-
-    # Segment
-    df = segment_reviews(df, vncorenlp_dir=vncorenlp_dir)
-
-    if save_csv_path is not None:
-        save_csv_path = Path(save_csv_path)
-        df.to_csv(save_csv_path, index=False, encoding="utf-8-sig")
-        logger.info("Saved processed DataFrame to %s", save_csv_path)
-
-    return df
-
-
-def build_corpus(df: pd.DataFrame, text_col: str = "segmented_comment") -> Dict[str, int]:
-    """
-    Build frequency dictionary (word -> count) from df[text_col].
-    Accepts both string entries or list-like (token lists).
-    """
-    if text_col not in df.columns:
-        raise ValueError(f"Column {text_col} not present in DataFrame.")
-
-    corpus: Dict[str, int] = {}
-    for value in tqdm(df[text_col].tolist(), desc=f"Building corpus from {text_col}"):
-        if value is None:
-            continue
-        if isinstance(value, (list, tuple)):
-            tokens = [str(x).lower() for x in value]
+        # get base dataframe
+        if hasattr(dataset, "data"):
+            base_df = dataset.data.copy().reset_index(drop=True)
+        elif isinstance(dataset, pd.DataFrame):
+            base_df = dataset.copy().reset_index(drop=True)
         else:
-            tokens = tokenize_words(str(value))
-        for w in tokens:
-            if not w:
+            raise TypeError("dataset must be a CSVDataset-like object with .data or a pandas.DataFrame")
+
+        # quick returns for degenerate cases
+        if base_df.empty:
+            logger.warning("Input dataframe is empty; returning (None, None, None).")
+            return None, None, None
+
+        # handle stratify column presence
+        stratify_series = None
+        if stratify_col:
+            if stratify_col not in base_df.columns:
+                raise ValueError(f"Stratify column '{stratify_col}' not found in dataset.")
+            stratify_series = base_df[stratify_col]
+
+        # If train_ratio == 1.0 just return all as train
+        if train_ratio == 1.0:
+            return base_df, None, None
+        # If dev_ratio == 1.0 or test_ratio == 1.0 (others zero)
+        if dev_ratio == 1.0:
+            return None, base_df, None
+        if test_ratio == 1.0:
+            return None, None, base_df
+
+        # Helper to decide whether stratify argument is valid for a given series
+        def valid_stratify(s: Optional[pd.Series]) -> Optional[pd.Series]:
+            if s is None:
+                return None
+            # drop NA for stratify decision
+            uniq = s.dropna().unique()
+            if len(uniq) <= 1:
+                # cannot stratify when only one class present
+                return None
+            return s
+
+        # First split: train vs remaining
+        stratify_for_first = valid_stratify(stratify_series)
+        train_df, remaining_df = train_test_split(
+            base_df,
+            train_size=train_ratio,
+            stratify=stratify_for_first,
+            random_state=random_state,
+            shuffle=True
+        )
+
+        # if dev and test both zero
+        if dev_ratio == 0 and test_ratio == 0:
+            return train_df, None, None
+
+        remaining_total = dev_ratio + test_ratio
+        if remaining_total == 0 or remaining_df.empty:
+            return train_df, None, None
+
+        # If one of dev/test is zero, remaining goes to the other
+        if dev_ratio == 0:
+            return train_df, None, remaining_df.reset_index(drop=True)
+        if test_ratio == 0:
+            return train_df, remaining_df.reset_index(drop=True), None
+
+        # both dev and test > 0 -> split remaining
+        dev_rel_ratio = dev_ratio / remaining_total
+        stratify_remaining = None
+        if stratify_col and stratify_col in remaining_df.columns:
+            stratify_remaining = valid_stratify(remaining_df[stratify_col])
+
+        dev_df, test_df = train_test_split(
+            remaining_df,
+            train_size=dev_rel_ratio,
+            stratify=stratify_remaining,
+            random_state=random_state,
+            shuffle=True
+        )
+
+        # reset indices before returning
+        return train_df.reset_index(drop=True), dev_df.reset_index(drop=True), test_df.reset_index(drop=True)
+
+    @staticmethod
+    def save_dataset(df: pd.DataFrame, out_path: Union[str, Path]) -> None:
+        """Save DataFrame to CSV file."""
+        if df is None or df.empty:
+            raise ValueError("Dataset cannot be empty.")
+
+        if isinstance(out_path, str):
+            out_path = Path(out_path)
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_path, index=False, encoding="utf-8-sig")
+        logger.info(f"Saved dataset at {out_path}")
+
+    def load_typo_mapper(self, mapper_path: Union[str, Path]) -> Dict[str, str]:
+        """Load JSON mapping file from disk."""
+        try:
+            with open(mapper_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Mapper JSON must be an object/dict.")
+            return data
+        except Exception as e:
+            logger.exception("Failed to load mapper JSON")
+            raise
+
+    @staticmethod
+    def tokenize_words(review: str) -> list:
+        """Simple whitespace tokenizer (lowercases first)."""
+        if review is None:
+            return []
+        return str(review).lower().strip().split()
+
+    def mapping_typo_token(self, token: str) -> str:
+        """Map a single token using the mapper; return token if no mapping exists."""
+        if not self.mapper:
+            raise ValueError("Mapper has not been initialized yet.")
+        return self.mapper.get(token, token)
+
+    @staticmethod
+    def segment_review(segmenter: Any, text: Optional[str]) -> str:
+        """
+        Wrap the actual call to the segmenter. This default assumes a simple API:
+            segmenter.word_segment(text)
+        Override this method if your segmenter requires different invocation.
+        """
+        if text is None:
+            return ""
+        return segmenter.word_segment(text)[0]
+
+
+    def ensure_vncorenlp_models(self, vncorenlp_dir: Path) -> bool:
+        """
+        Check that VnCoreNLP models are present at vncorenlp_dir.
+        This is intentionally conservative: return True only if directory exists.
+        Replace/enhance with real checks if you know required files.
+        """
+        try:
+            if not vncorenlp_dir.exists():
+                logger.warning("vncorenlp_dir does not exist: %s", vncorenlp_dir)
+                return False
+            return True
+        except Exception:
+            logger.exception("Error while checking VnCoreNLP models directory")
+            return False
+
+    def build_segmenter(self) -> Any:
+        """
+        Lazy-create and return a singleton segmenter instance.
+        Raises ImportError if py_vncorenlp is unavailable.
+        """
+        if self._SEGMENTER_INSTANCE is not None:
+            logger.debug("Reusing existing segmenter instance.")
+            return self._SEGMENTER_INSTANCE
+
+        if py_vncorenlp is None:
+            raise ImportError("py_vncorenlp is not installed. Install with: pip install py_vncorenlp")
+
+        if not self.vncorenlp_dir or not self.has_vncorenlp:
+            raise RuntimeError("VnCoreNLP models are not available. Set vncorenlp_dir and ensure models exist.")
+
+        try:
+            # instantiate according to the py_vncorenlp API
+            self._SEGMENTER_INSTANCE = py_vncorenlp.VnCoreNLP(annotators=["wseg"], save_dir=str(self.vncorenlp_dir))
+            logger.info("VnCoreNLP segmenter created.")
+            return self._SEGMENTER_INSTANCE
+        except Exception:
+            logger.exception("Failed to create VnCoreNLP segmenter")
+            raise
+
+    def segment_reviews(
+        self,
+        df: pd.DataFrame,
+        segmenter: Optional[Any] = None,
+        text_col: str = "preprocessed_review",
+        output_col: str = "segmented_comment",
+    ) -> pd.DataFrame:
+        """
+        Segment `text_col` in `df` and return a copy with `output_col` added.
+
+        - Raises ValueError if `text_col` is missing or df is empty.
+        - Raises RuntimeError if VnCoreNLP models are not available.
+        """
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df must be a pandas.DataFrame")
+
+        if text_col not in df.columns:
+            raise ValueError(f"DataFrame must contain '{text_col}' column before segmentation.")
+
+        if df.empty:
+            raise ValueError("DataFrame is empty.")
+
+        if not self.has_vncorenlp:
+            raise RuntimeError("VnCoreNLP models are not available. Set vncorenlp_dir and ensure models exist.")
+
+        # allow caller to pass a pre-built segmenter (useful for tests)
+        if segmenter is None:
+            segmenter = self.build_segmenter()
+
+        segmented = []
+        # iterate with tqdm for user feedback
+        for text in tqdm(df[text_col].astype(str).tolist(), desc=f"Segmenting {text_col}"):
+            try:
+                seg = self.segment_review(segmenter, text)
+            except Exception:
+                logger.exception("Segmentation failed for a review; using original text.")
+                seg = text or ""
+            segmented.append(seg)
+
+        out_df = df.copy()
+        out_df[output_col] = segmented
+        return out_df
+
+    def preprocess_text(self,
+                        df: pd.DataFrame,
+                        input_col: str = "comment",
+                        output_col: str = "preprocessed_review") -> pd.DataFrame:
+        """
+        Apply typo mapping to text column.
+
+        Args:
+            df: DataFrame containing the input column
+            input_col: Name of input column with raw text
+            output_col: Name of output column for preprocessed text
+
+        Returns:
+            DataFrame with new preprocessed column
+        """
+        if self.mapper is None:
+            raise ValueError("Mapper not initialized. Initialize with mapper_path or call load_typo_mapper().")
+
+        if input_col not in df.columns:
+            raise ValueError(f"DataFrame must contain '{input_col}' column.")
+
+        preprocessed_list = []
+        for comment in tqdm(df[input_col].tolist(), desc="Mapping typos"):
+            tokens = self.tokenize_words(comment)
+            mapped = [self.mapping_typo_token(t) for t in tokens]
+            preprocessed_list.append(" ".join(mapped))
+
+        out_df = df.copy(deep=True)
+        out_df[output_col] = preprocessed_list
+        return out_df
+
+    def preprocessing_pipeline(self,
+                               dataset: pd.DataFrame,
+                               input_col: str = "comment",
+                               intermediate_col: str = "preprocessed_review",
+                               output_col: str = "segmented_comment") -> pd.DataFrame:
+        """
+        Full preprocessing pipeline:
+        1. Load typo mapping
+        2. Fix token-level typos: input_col -> intermediate_col
+        3. Segment reviews: intermediate_col -> output_col
+
+        Args:
+            mapper_path: Path to typo mapping JSON file
+            vncorenlp_dir: Path to VnCoreNLP models directory
+            input_col: Name of original text column
+            intermediate_col: Name of intermediate preprocessed column
+            output_col: Name of final segmented column
+
+        Returns:
+            Processed DataFrame with new columns
+        """
+        if dataset is None:
+            raise ValueError("No training dataset available.")
+
+        # Load mapper if provided or ensure it's already loaded
+        if self.mapper is None:
+            raise ValueError("Mapper not initialized. Provide mapper_path or initialize Preprocessor with mapper_path.")
+
+        logger.info("Starting preprocessing pipeline...")
+
+        # Step 1: Typo mapping
+        logger.info(f"Step 1: Mapping typos from '{input_col}' -> '{intermediate_col}'")
+        out_df = self.preprocess_text(
+            dataset,
+            input_col=input_col,
+            output_col=intermediate_col
+        )
+
+        # Step 2: Segmentation
+        logger.info(f"Step 2: Segmenting text from '{intermediate_col}' -> '{output_col}'")
+        out_df = self.segment_reviews(
+            out_df,
+            text_col=intermediate_col,
+            output_col=output_col
+        )
+
+        logger.info("Preprocessing pipeline completed successfully.")
+        return out_df
+
+    def apply_balancing(self,
+                        df: pd.DataFrame,
+                        method: str = "none",
+                        text_col: str = "preprocessed_review",
+                        label_col: str = "label",
+                        augmentation_factor: float = 2.0,
+                        random_state: int = 42,
+                        device: str = "cuda") -> pd.DataFrame:
+        """
+        Apply data balancing/augmentation to handle imbalanced classes.
+
+        Args:
+            df: DataFrame to balance
+            method: Balancing method ("none", "back_translation", "random_oversampling")
+            text_col: Column containing text data
+            label_col: Column containing labels
+            augmentation_factor: Factor for augmentation (e.g., 2.0 for doubling minority class)
+            random_state: Random seed
+            device: Device for back-translation ("cuda" or "cpu")
+
+        Returns:
+            Balanced DataFrame
+        """
+        if method == "none":
+            logger.info("No balancing applied.")
+            return df
+
+        elif method == "back_translation":
+            logger.info("Applying back-translation augmentation...")
+            balanced_df = apply_back_translation(
+                train_csv=df,
+                text_col=text_col,
+                label_col=label_col,
+                output_csv=None,
+                augmentation_factor=augmentation_factor,
+                random_state=random_state,
+                device=device
+            )
+            return balanced_df
+
+        else:
+            raise ValueError(f"Unknown balancing method: {method}")
+
+    def build_corpus(self,
+                     df: pd.DataFrame,
+                     data_col: str = "segmented_comment",
+                     save: bool = False,
+                     save_path: Union[str, Path] = "../dataset/data/") -> Dict[str, int]:
+        """
+        Build frequency dictionary (word -> count) from df[text_col].
+        Accepts both string entries or list-like (token lists).
+        """
+        if data_col not in df.columns:
+            raise ValueError(f"Column {data_col} not present in DataFrame.")
+
+        corpus: Dict[str, int] = {}
+        for value in tqdm(df[data_col].tolist(), desc=f"Building corpus from {data_col}"):
+            if value is None:
                 continue
-            corpus[w] = corpus.get(w, 0) + 1
-    return corpus
+            if isinstance(value, (list, tuple)):
+                tokens = [str(x).lower() for x in value]
+            else:
+                tokens = self.tokenize_words(str(value))
+            for w in tokens:
+                if not w:
+                    continue
+                corpus[w] = corpus.get(w, 0) + 1
+
+        if save:
+            save_path = Path(save_path) / 'corpus.json'
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(corpus, f, ensure_ascii=False, indent=2)
+            logger.info(f"Corpus saved to {save_path} with {len(corpus)} unique tokens")
+
+        return corpus
 
 
-def split_train_dev(df: pd.DataFrame,
-                    train_ratio: float = 0.8,
-                    random_state: int = 42,
-                    stratify_col: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Split DataFrame into train and dev sets.
-
-    Args:
-        df: Input DataFrame
-        train_ratio: Ratio of training data (default: 0.8 for 80/20 split)
-        random_state: Random seed for reproducibility
-        stratify_col: Column name for stratified splitting (e.g., 'label')
-
-    Returns:
-        Tuple of (train_df, dev_df)
-    """
-    stratify = df[stratify_col] if stratify_col and stratify_col in df.columns else None
-
-    train_df, dev_df = train_test_split(
-        df,
-        train_size=train_ratio,
-        random_state=random_state,
-        stratify=stratify,
-        shuffle=True
-    )
-
-    logger.info(f"Split dataset: train={len(train_df)}, dev={len(dev_df)}")
-    return train_df.reset_index(drop=True), dev_df.reset_index(drop=True)
-
-
-# ---- main usage example ----
+# ---- Main usage example ----
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Data preprocessing and splitting pipeline")
     parser.add_argument("--csv", required=True, help="input csv path (must contain 'comment' column)")
-    parser.add_argument("--mapping", default="mapping.json", help="typo mapping json")
-    parser.add_argument("--vncorenlp_dir", default="notebooks/vncorenlp",
-                        help="vncorenlp models directory (will be converted to absolute path)")
-    parser.add_argument("--out_dir", default="dataset/data",
-                        help="output directory")
-    parser.add_argument("--train_ratio", type=float, default=0.8, help="train split ratio (default: 0.8)")
-    parser.add_argument("--stratify_col", default="label", help="column name for stratified split (e.g., 'label')")
-    parser.add_argument("--random_state", type=int, default=42, help="random seed")
-    parser.add_argument("--balance_method", choices=["back_translation", "random", "none"],
-                       default="none", help="method to balance dataset")
+    parser.add_argument("--train_ratio", type=float, default=0.7, help="train split ratio")
+    parser.add_argument("--dev_ratio", type=float, default=0.15, help="dev split ratio")
+    parser.add_argument("--test_ratio", type=float, default=0.15, help="test split ratio")
+    parser.add_argument("--data_col", default="comment", help="column name for the reviews")
+    parser.add_argument("--label_col", default="label", help="column name for the labels")
+    parser.add_argument("--stratify_col", default="label", help="column name for stratified split")
+    parser.add_argument("--mapper_path", required=True, help="typo mapping json")
+    parser.add_argument("--vncorenlp_dir", default="../notebooks/vncorenlp", help="vncorenlp models directory")
+    parser.add_argument("--out_dir", default="dataset/data", help="output directory")
+    parser.add_argument("--random_state", type=int, default=50, help="random seed")
+    parser.add_argument("--model", type=str, default="vinai/phobert-base", help="model name")
+    parser.add_argument("--balance_method", choices=["back_translation", "none"],
+                        default="none", help="method to balance dataset")
     parser.add_argument("--augmentation_factor", type=float, default=2.0,
-                       help="augmentation factor for back-translation")
+                        help="augmentation factor for back-translation")
+    parser.add_argument("--device", default="cuda", help="device for augmentation (cuda/cpu)")
+
     args = parser.parse_args()
 
     # Convert paths to absolute paths
-    vncorenlp_dir = Path(args.vncorenlp_dir).resolve()
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info(f"Using VnCoreNLP directory: {vncorenlp_dir}")
     logger.info(f"Output directory: {out_dir}")
 
-    # Load and preprocess full dataset
-    logger.info("Loading and preprocessing data...")
-    df_in = pd.read_csv(args.csv)
-    processed = preprocessing(
-        df_in,
-        mapper_path=Path(args.mapping).resolve(),
-        vncorenlp_dir=vncorenlp_dir,
-        save_csv_path=out_dir / "processed_full.csv"
+    # Load dataset
+    logger.info("Loading data...")
+    data = pd.read_csv(args.csv)
+
+    # Initialize preprocessor
+    processor = Preprocessor(mapper_path=args.mapper_path, vncorenlp_dir=args.vncorenlp_dir)
+
+    # ============================================================
+    # STEP 1: Full preprocessing pipeline (typo mapping + segmentation)
+    # ============================================================
+    logger.info("Running preprocessing pipeline...")
+    preprocessed_df = processor.preprocessing_pipeline(
+        dataset=data,
+        input_col=args.data_col,
+        intermediate_col="preprocessed_review",
+        output_col="segmented_comment"
     )
 
     # Build corpus BEFORE splitting (important for vocabulary consistency)
     logger.info("Building corpus from full dataset...")
-    corpus = build_corpus(processed, text_col="segmented_comment")
-    corpus_path = out_dir / "corpus_freq.json"
-    with open(corpus_path, "w", encoding="utf-8") as fh:
-        json.dump(corpus, fh, ensure_ascii=False, indent=2)
-    logger.info(f"Corpus saved to {corpus_path} with {len(corpus)} unique tokens")
-
-    # Split into train and dev
-    logger.info("Splitting dataset into train and dev...")
-    train_df, dev_df = split_train_dev(
-        processed,
-        train_ratio=args.train_ratio,
-        random_state=args.random_state,
-        stratify_col=args.stratify_col
+    corpus = processor.build_corpus(
+        preprocessed_df,
+        data_col="segmented_comment",
+        save=True,
+        save_path=out_dir
     )
 
-    # Apply balancing method if specified
-    if args.balance_method != "none":
-        # Save initial train split
-        initial_train_path = out_dir / "train_before_balance.csv"
-        train_df.to_csv(initial_train_path, index=False, encoding="utf-8-sig")
-        logger.info(f"Initial train set saved to {initial_train_path}")
-        
-        logger.info(f"Applying {args.balance_method} to balance the training set...")
-        
-        if args.balance_method == "back_translation":
-            
-            # Back-translation needs to be done on the CSV file
-            temp_train_path = out_dir / "temp_train_unbalanced.csv"
-            train_df.to_csv(temp_train_path, index=False, encoding="utf-8-sig")
-            
-            # Apply back-translation (it will handle preprocessing and segmentation)
-            balanced_train_df = apply_back_translation(
-                train_csv=temp_train_path,
-                text_col="segmented_comment",
-                label_col="label",
-                output_csv=None,  # Don't save yet
-                augmentation_factor=args.augmentation_factor,
-                random_state=args.random_state
-            )
-            
-            # Clean up temp file
-            if temp_train_path.exists():
-                temp_train_path.unlink()
-            
-            train_df = balanced_train_df
-            
-        elif args.balance_method == "random":
-            from imbalance_handler import apply_random_oversampling
-            
-            temp_train_path = out_dir / "temp_train_unbalanced.csv"
-            train_df.to_csv(temp_train_path, index=False, encoding="utf-8-sig")
-            
-            balanced_train_df = apply_random_oversampling(
-                train_csv=temp_train_path,
-                label_col="label",
-                output_csv=None,
-                sampling_strategy="auto",
-                random_state=args.random_state
-            )
-            
-            # Clean up temp file
-            if temp_train_path.exists():
-                temp_train_path.unlink()
-            
-            train_df = balanced_train_df
+    # ============================================================
+    # STEP 2: Split into train/dev/test BEFORE balancing
+    # ============================================================
+    logger.info("Splitting dataset into train/dev/test...")
+    ratios = [args.train_ratio, args.dev_ratio, args.test_ratio]
+    train_df, dev_df, test_df = processor.split_train_test(preprocessed_df, ratios, args.stratify_col, args.random_state)
 
-    # Save final splits
-    train_path = out_dir / "train.csv"
-    dev_path = out_dir / "dev.csv"
-    train_df.to_csv(train_path, index=False, encoding="utf-8-sig")
-    dev_df.to_csv(dev_path, index=False, encoding="utf-8-sig")
+    # ============================================================
+    # STEP 3: Apply balancing ONLY to training data
+    # ============================================================
 
-    logger.info(f"Train set saved to {train_path} ({len(train_df)} samples)")
-    logger.info(f"Dev set saved to {dev_path} ({len(dev_df)} samples)")
-    
-    # Print class distribution
-    if 'label' in train_df.columns:
-        train_dist = train_df['label'].value_counts().sort_index()
-        logger.info(f"Final training set distribution:\n{train_dist}")
-    
-    logger.info("Done!")
+    if args.balance_method != "none" and train_df is not None:
+        logger.info(f"Applying {args.balance_method} balancing to training data...")
+        balanced_train_df = processor.apply_balancing(
+            train_df,
+            method=args.balance_method,
+            text_col="preprocessed_review",
+            label_col=args.label_col,
+            augmentation_factor=args.augmentation_factor,
+            random_state=args.random_state,
+            device=args.device
+        )
+
+        # Re-segment the balanced training data
+        logger.info("Segmenting balanced training data...")
+        balanced_train_df = processor.segment_reviews(
+            balanced_train_df,
+            text_col="preprocessed_review",
+            output_col="segmented_comment"
+        )
+
+        train_df = balanced_train_df
+        logger.info(f"Balanced training dataset: {len(balanced_train_df)} samples")
+
+
+    # ============================================================
+    # STEP 4: Save splits
+    # ============================================================
+    logger.info("Saving datasets...")
+    if train_df is not None:
+        train_path = out_dir / "train.csv"
+        processor.save_dataset(train_df, train_path)
+        logger.info(f"Train set saved: {len(train_df)} samples")
+        if args.label_col in train_df.columns:
+            logger.info(f"Train distribution:\n{train_df[args.label_col].value_counts().sort_index()}")
+
+    if dev_df is not None:
+        dev_path = out_dir / "dev.csv"
+        processor.save_dataset(dev_df, dev_path)
+        logger.info(f"Dev set saved: {len(dev_df)} samples")
+        if args.label_col in dev_df.columns:
+            logger.info(f"Dev distribution:\n{dev_df[args.label_col].value_counts().sort_index()}")
+
+    if test_df is not None:
+        test_path = out_dir / "test.csv"
+        processor.save_dataset(test_df, test_path)
+        logger.info(f"Test set saved: {len(test_df)} samples")
+        if args.label_col in test_df.columns:
+            logger.info(f"Test distribution:\n{test_df[args.label_col].value_counts().sort_index()}")
+
+    logger.info("Pipeline completed successfully!")

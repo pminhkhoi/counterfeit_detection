@@ -4,7 +4,7 @@ import torch
 
 
 class CSVDataset(Dataset):
-    def __init__(self, data, text_col, label_col=None, tokenizer=None, max_length=256):
+    def __init__(self, data, data_col, label_col=None, tokenizer=None, max_length=256):
         """
         data: path to CSV file OR a pandas DataFrame
         """
@@ -15,7 +15,7 @@ class CSVDataset(Dataset):
         else:
             raise ValueError("Data must be a path (str) or a pandas DataFrame")
 
-        self.text_col = text_col
+        self.data_col = data_col
         self.label_col = label_col
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -25,7 +25,7 @@ class CSVDataset(Dataset):
 
     def __getitem__(self, idx):
         # Ensure text is string
-        text = str(self.data.iloc[idx][self.text_col])
+        text = str(self.data.iloc[idx][self.data_col])
 
         encoding = self.tokenizer(
             text,

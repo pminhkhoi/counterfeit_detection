@@ -51,7 +51,7 @@ def save_training_history_plots(history, model_name, task, output_dir=None):
     ax.spines['bottom'].set_visible(False)
     ax.legend(loc='center left', bbox_to_anchor=(1.05, 0.5), frameon=False, prop={'size': 10})
     
-    file_name = output_dir / f"{model_name}_loss_visualization_({task}).png"
+    file_name = output_dir / f"{model_name}_loss_visualization_{task}.png"
     fig.savefig(file_name, dpi=300, bbox_inches='tight')
     plt.close(fig)
     
@@ -73,7 +73,7 @@ def save_training_history_plots(history, model_name, task, output_dir=None):
     ax.spines['bottom'].set_visible(False)
     ax.legend(loc='center left', bbox_to_anchor=(1.05, 0.5), frameon=False, prop={'size': 10})
     
-    file_name = output_dir / f"{model_name}_accuracy_visualization_({task}).png"
+    file_name = output_dir / f"{model_name}_accuracy_visualization_{task}.png"
     fig.savefig(file_name, dpi=300, bbox_inches='tight')
     plt.close(fig)
     

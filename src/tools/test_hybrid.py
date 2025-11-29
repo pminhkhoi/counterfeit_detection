@@ -1,3 +1,6 @@
+"""
+Testing script for Hybrid Model (PhoBERT + CNN + BiLSTM).
+"""
 import os
 import gc
 import json
@@ -19,7 +22,7 @@ project_dir = current_dir.parent
 sys.path.insert(0, str(project_dir))
 
 from dataset.dataset import CSVDataset
-from models.PhoBert import ViSpam_Classifier
+from models.hybrid_model import HybridModel
 from utils.metrics import calculate_metrics, print_metrics
 from utils.visualization import (
     plot_confusion_matrix,
@@ -27,18 +30,17 @@ from utils.visualization import (
     plot_precision_recall_curve,
     plot_class_distribution
 )
-from preprocess.preprocessing import Preprocessor
 
 
 def test_step(model, dataloader, device='cpu'):
     """
     Run inference on test data and collect predictions with probabilities.
-    
+
     Args:
-        model: The model to evaluate
+        model: The Hybrid model to evaluate
         dataloader: Test data loader
         device: Device to run on ('cpu' or 'cuda')
-    
+
     Returns:
         Tuple of (trues, predicts, probabilities)
         - trues: array of true labels
@@ -47,45 +49,45 @@ def test_step(model, dataloader, device='cpu'):
     """
     model.eval()
     model.to(device)
-    
+
     trues = []
     predicts = []
     probabilities = []
-    
+
     with torch.no_grad():
         for data in tqdm(dataloader, desc="Testing", leave=False):
             input_ids = data['input_ids'].to(device)
             attention_mask = data['attention_mask'].to(device)
             labels = data['label'].to(device)
-            
-            # Handle optional category_id
-            category_id = data.get('category_id')
-            if category_id is not None:
-                category_id = category_id.to(device)
-            
-            # Forward pass
-            if category_id is not None:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, category_id=category_id)
-            else:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            
+
+            # Forward pass through Hybrid model
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
             # Get predictions
             pred = torch.max(outputs, dim=1)[1]
-            
+
             # Get probabilities using softmax
             probs = torch.softmax(outputs, dim=1)
-            
+
             # Store results
             trues.extend(labels.cpu().numpy())
             predicts.extend(pred.cpu().numpy())
             probabilities.extend(probs.cpu().numpy())
-    
+
     return np.array(trues), np.array(predicts), np.array(probabilities)
 
 
 def save_predictions(test_df, y_true, y_pred, y_probs, save_path, text_col='segmented_comment'):
     """
     Save predictions with original text to CSV for error analysis.
+
+    Args:
+        test_df: Original test dataframe
+        y_true: True labels
+        y_pred: Predicted labels
+        y_probs: Prediction probabilities
+        save_path: Path to save predictions CSV
+        text_col: Column name containing text
     """
     results_df = test_df.copy()
     results_df['true_label'] = y_true
@@ -130,54 +132,69 @@ def save_predictions(test_df, y_true, y_pred, y_probs, save_path, text_col='segm
                 print(
                     f"True: {row['true_label']}, Predicted: {row['predicted_label']}, Confidence: {row['confidence']:.4f}\n")
 
+
 def generate_classification_report(y_true, y_pred, class_names, save_path):
     """
     Generate and save detailed classification report.
+
+    Args:
+        y_true: True labels
+        y_pred: Predicted labels
+        class_names: Names of classes
+        save_path: Path to save report
     """
     report = classification_report(y_true, y_pred, target_names=class_names, digits=4)
-    
+
     print("\nClassification Report:")
     print(report)
-    
+
     with open(save_path, 'w', encoding='utf-8') as f:
         f.write("CLASSIFICATION REPORT\n")
-        f.write("="*60 + "\n\n")
+        f.write("=" * 60 + "\n\n")
         f.write(report)
-    
+
     print(f"Classification report saved to {save_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Test script for spam classification model')
+    parser = argparse.ArgumentParser(description='Test Hybrid model for spam classification')
+
+    # Data arguments
     parser.add_argument('--test_csv', type=str, required=True, help='Path to test CSV file')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint (.pth file)')
     parser.add_argument('--text_col', type=str, default='segmented_comment', help='Column name for text input')
     parser.add_argument('--label_col', type=str, default='label', help='Column name for labels')
-    parser.add_argument('--model_name', type=str, default='vinai/phobert-base', help='Pretrained model name')
+
+    # Model arguments
+    parser.add_argument('--phobert_model', type=str, default='vinai/phobert-base',
+                        help='PhoBERT model name (default: vinai/phobert-base)')
+    parser.add_argument('--cnn_out_channels', type=int, default=128,
+                        help='Number of output channels for each CNN layer (default: 128)')
+    parser.add_argument('--lstm_hidden_size', type=int, default=128,
+                        help='Hidden size for BiLSTM (default: 128)')
+    parser.add_argument('--lstm_layers', type=int, default=1,
+                        help='Number of BiLSTM layers (default: 1)')
+    parser.add_argument('--dropout', type=float, default=0.3,
+                        help='Dropout rate (default: 0.3)')
+
+    # Testing arguments
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for testing')
     parser.add_argument('--max_len', type=int, default=256, help='Maximum sequence length')
-    parser.add_argument('--output_dir', type=str, default='results/test_results', help='Directory to save results')
+    parser.add_argument('--output_dir', type=str, default='results/test_results_hybrid',
+                        help='Directory to save results')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes to predict')
-    parser.add_argument('--class_names', type=str, nargs='+', default=['Normal', 'Spam'], 
-                       help='Names of classes (in order)')
+    parser.add_argument('--class_names', type=str, nargs='+', default=['Normal', 'Spam'],
+                        help='Names of classes (in order)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
-
-    parser.add_argument("--preprocess", action="store_true", 
-                       help="Apply preprocessing (typo mapping + segmentation) before prediction")
-    parser.add_argument("--mapping_path", type=str, default="src/mapping.json",
-                       help="Path to typo mapping JSON file (required if --preprocess is used)")
-    parser.add_argument("--vncorenlp_dir", type=str, default="../notebooks/vncorenlp",
-                       help="Path to VnCoreNLP models directory (required if --preprocess is used)")
-    
     args = parser.parse_args()
-    
+
     # Set seed for reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    
+
     # Create timestamped output directory
     now = datetime.datetime.now()
     folder_name = now.strftime("%Y-%m-%d_%H-%M-%S")
@@ -190,50 +207,20 @@ def main():
     except Exception as e:
         print(f"Error creating output directory: {e}")
         raise
-    
+
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
+
     # Clean up memory
     torch.cuda.empty_cache()
     gc.collect()
-    
+
     # Load test data
     print(f"\nLoading test data from {args.test_csv}...")
     test_df = pd.read_csv(args.test_csv)
     print(f"Test samples: {len(test_df)}")
-    
-    # Apply preprocessing if requested
-    if args.preprocess:
-        processor = Preprocessor(
-            mapper_path=args.mapping_path,
-            vncorenlp_dir=args.vncorenlp_dir,
-        )
 
-        print("\nApplying preprocessing (typo mapping + segmentation)...")
-        print(f"Mapping file: {args.mapping_path}")
-        print(f"VnCoreNLP directory: {args.vncorenlp_dir}")
-        
-        # Check if 'comment' column exists (required for preprocessing)
-        if args.text_col not in test_df.columns:
-            raise ValueError(f"Column {args.text_col} not found for preprocessing")
-        
-        # Apply preprocessing
-        processed_df = processor.preprocessing_pipeline(
-            test_df,
-            input_col=args.text_col
-        )
-
-        test_df = processed_df
-        
-        # Update text column to use segmented_comment if it exists
-        if 'segmented_comment' in processed_df.columns:
-            print("Using segmented_comment column for evaluation")
-            args.text_col = 'segmented_comment'
-        else:
-            print("Warning: Preprocessing did not create expected columns. Using original text column.")
-    
     # Show class distribution
     if args.label_col in test_df.columns:
         class_dist = test_df[args.label_col].value_counts().sort_index()
@@ -241,105 +228,121 @@ def main():
         print(class_dist)
 
     # Initialize tokenizer
-    print(f"\nInitializing tokenizer ({args.model_name})...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    
+    print(f"\nInitializing tokenizer ({args.phobert_model})...")
+    tokenizer = AutoTokenizer.from_pretrained(args.phobert_model)
+
     # Create dataset and dataloader
-    # Use DataFrame directly if preprocessing was applied, otherwise use CSV path
     test_dataset = CSVDataset(
         test_df,
-        args.text_col, 
-        args.label_col, 
-        tokenizer, 
+        args.text_col,
+        args.label_col,
+        tokenizer,
         args.max_len
     )
     test_loader = DataLoader(
-        test_dataset, 
-        batch_size=args.batch_size, 
+        test_dataset,
+        batch_size=args.batch_size,
         shuffle=False
     )
-    
-    # Initialize model
-    print("\nInitializing model...")
-    model = ViSpam_Classifier(model_name=args.model_name)
-    
+
+    # Initialize Hybrid model
+    print("\nInitializing Hybrid model...")
+    print(f"  - PhoBERT: {args.phobert_model}")
+    print(f"  - CNN Output Channels: {args.cnn_out_channels}")
+    print(f"  - LSTM Hidden Size: {args.lstm_hidden_size}")
+    print(f"  - LSTM Layers: {args.lstm_layers}")
+    print(f"  - Dropout: {args.dropout}")
+
+    model = HybridModel(
+        phobert_model_name=args.phobert_model,
+        cnn_out_channels=args.cnn_out_channels,
+        lstm_hidden_size=args.lstm_hidden_size,
+        lstm_layers=args.lstm_layers,
+        num_classes=args.num_classes,
+        dropout=args.dropout
+    )
+
     # Load checkpoint
     print(f"\nLoading checkpoint from {args.checkpoint}...")
     try:
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        
+
         # Handle different checkpoint formats
-        if 'model_state_dict' in checkpoint:
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
             if 'epoch' in checkpoint:
                 print(f"Model trained for {checkpoint['epoch']} epochs")
             if 'best_f1' in checkpoint:
                 print(f"Best validation F1: {checkpoint['best_f1']:.4f}")
         else:
-            # Old format: just state dict
+            # State dict only
             model.load_state_dict(checkpoint)
-        
+
         print("Checkpoint loaded successfully!")
     except Exception as e:
         print(f"Error loading checkpoint: {e}")
-        return
-    
+        raise
+
     model.to(device)
-    
+
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total model parameters: {total_params:,}")
+
     # Run testing
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("STARTING EVALUATION")
-    print("="*60)
-    
+    print("=" * 60)
+
     y_true, y_pred, y_probs = test_step(model, test_loader, device=device)
-    
+
     # Calculate metrics
     print("\nCalculating metrics...")
     metrics = calculate_metrics(y_true, y_pred, y_probs=y_probs, num_classes=args.num_classes)
-    
+
     # Print metrics
     print_metrics(metrics, num_classes=args.num_classes)
-    
+
     # Save metrics to JSON
     metrics_path = output_dir / 'test_metrics.json'
     with open(metrics_path, 'w', encoding='utf-8') as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
     print(f"\nMetrics saved to {metrics_path}")
-    
+
     # Generate classification report
     report_path = output_dir / 'classification_report.txt'
     generate_classification_report(y_true, y_pred, args.class_names, report_path)
-    
+
     # Plot confusion matrix
     cm = np.array(metrics['confusion_matrix'])
     cm_path = output_dir / 'confusion_matrix.png'
     plot_confusion_matrix(cm, args.class_names, cm_path)
-    
+
     # Plot ROC curve
     try:
         roc_path = output_dir / 'roc_curve.png'
         plot_roc_curve(y_true, y_probs, args.num_classes, roc_path)
     except Exception as e:
         print(f"Could not plot ROC curve: {e}")
-    
+
     # Plot Precision-Recall curve
     try:
         pr_path = output_dir / 'precision_recall_curve.png'
         plot_precision_recall_curve(y_true, y_probs, args.num_classes, pr_path)
     except Exception as e:
         print(f"Could not plot PR curve: {e}")
-    
+
     # Plot class distribution
     dist_path = output_dir / 'class_distribution.png'
     plot_class_distribution(y_true, y_pred, args.class_names, dist_path)
-    
+
     # Save predictions for error analysis
     predictions_path = output_dir / 'predictions.csv'
     save_predictions(test_df, y_true, y_pred, y_probs, predictions_path, args.text_col)
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("EVALUATION COMPLETED")
-    print("="*60)
+    print("=" * 60)
     print(f"\nAll results saved to: {output_dir}")
 
 
